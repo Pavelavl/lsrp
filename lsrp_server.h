@@ -19,4 +19,9 @@ typedef int (*lsrp_handler_t)(lsrp_request_t *req, lsrp_response_t *resp);
  */
 int lsrp_server_start(int port, lsrp_handler_t handler);
 
+struct handle_args {
+    int client_sock;
+    lsrp_handler_t handler;
+};
+
 #endif // LSRP_SERVER_H
