@@ -2,6 +2,12 @@
 #define LSRP_CLIENT_H
 
 #include "lsrp.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <errno.h>
 
 /**
  * Send LSRP request to server and get response.

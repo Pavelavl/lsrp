@@ -1,12 +1,4 @@
 #include "lsrp_client.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <netdb.h>
 
 static void uint32_to_be(uint32_t val, uint8_t *bytes) {
     bytes[0] = (val >> 24) & 0xFF;
@@ -94,11 +86,20 @@ int lsrp_client_send(const char *host, int port, const char *params, lsrp_respon
         close(sock);
         return -11;
     }
-    recv_len = recv(sock, response->data, data_len, 0);
-    if (recv_len != data_len) {
-        free(response->data);
-        close(sock);
-        return -12;
+    ssize_t total_received = 0;
+    while (total_received < data_len) {
+        recv_len = recv(sock, response->data + total_received, data_len - total_received, 0);
+        if (recv_len <= 0) {
+            if (recv_len == 0) {
+                fprintf(stderr, "Server closed connection prematurely\n");
+            } else {
+                fprintf(stderr, "Error reading data: %s\n", strerror(errno));
+            }
+            free(response->data);
+            close(sock);
+            return -12;
+        }
+        total_received += recv_len;
     }
     response->data_len = data_len;
 
