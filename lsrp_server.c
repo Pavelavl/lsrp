@@ -58,6 +58,19 @@ static work_queue_t work_queue = {
     .shutdown = 0
 };
 
+static volatile sig_atomic_t server_running = 1;
+static int server_sock_global = -1;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    server_running = 0;
+    work_queue.shutdown = 1;
+    pthread_cond_broadcast(&work_queue.cond);
+    if (server_sock_global >= 0) {
+        shutdown(server_sock_global, SHUT_RDWR);
+    }
+}
+
 static void enqueue_work(int client_sock, lsrp_handler_t handler) {
     work_item_t *item = malloc(sizeof(work_item_t));
     if (!item) {
@@ -200,6 +213,14 @@ int lsrp_server_start(int port, lsrp_handler_t handler) {
 
     signal(SIGPIPE, SIG_IGN);
 
+    // Setup signal handlers for graceful shutdown
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         rl.rlim_cur = (rl.rlim_max < 65536) ? rl.rlim_max : 65536;
@@ -214,65 +235,67 @@ int lsrp_server_start(int port, lsrp_handler_t handler) {
         }
     }
 
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
+    server_sock_global = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock_global < 0) {
         fprintf(stderr, "Failed to create socket: %s\n", strerror(errno));
         return -2;
     }
 
     int opt = 1;
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(server_sock_global, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_sock_global, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     #ifdef TCP_DEFER_ACCEPT
     int timeout = 1;
-    setsockopt(server_sock, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout, sizeof(timeout));
+    setsockopt(server_sock_global, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout, sizeof(timeout));
     #endif
 
     int buf_size = 262144;
-    setsockopt(server_sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-    setsockopt(server_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(server_sock_global, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    setsockopt(server_sock_global, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
 
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (bind(server_sock_global, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "Failed to bind: %s\n", strerror(errno));
-        close(server_sock);
+        close(server_sock_global);
         return -3;
     }
 
-    if (listen(server_sock, LISTEN_BACKLOG) < 0) {
+    if (listen(server_sock_global, LISTEN_BACKLOG) < 0) {
         fprintf(stderr, "Failed to listen: %s\n", strerror(errno));
-        close(server_sock);
+        close(server_sock_global);
         return -4;
     }
 
-    fprintf(stderr, "LSRP server with thread pool (%d workers) listening on port %d\n", 
+    fprintf(stderr, "LSRP server with thread pool (%d workers) listening on port %d\n",
             THREAD_POOL_SIZE, port);
 
-    while (1) {
+    while (server_running) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
-        int client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &addr_len);
-        
+        int client_sock = accept(server_sock_global, (struct sockaddr*)&client_addr, &addr_len);
+
         if (client_sock < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EINVAL) continue;
             continue;
         }
 
         enqueue_work(client_sock, handler);
     }
 
+    fprintf(stderr, "\nShutting down LSRP server...\n");
     work_queue.shutdown = 1;
     pthread_cond_broadcast(&work_queue.cond);
-    
+
     for (int i = 0; i < THREAD_POOL_SIZE; i++) {
         pthread_join(workers[i], NULL);
     }
 
-    close(server_sock);
+    shutdown(server_sock_global, SHUT_RDWR);
+    close(server_sock_global);
     return 0;
 }
