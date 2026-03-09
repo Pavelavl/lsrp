@@ -1,4 +1,5 @@
 #include "lsrp_server.h"
+#include "../include/rrd_r.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,10 +13,15 @@
 #include <signal.h>
 #include <sys/epoll.h>
 
+extern void prewarm_thread_context(void);
+
 #define LISTEN_BACKLOG 4096
 #define RECV_BUFFER_SIZE 8192
-#define THREAD_POOL_SIZE 16
+#define DEFAULT_THREAD_POOL_SIZE 4
 #define MAX_EVENTS 512
+#define MAX_THREAD_POOL_SIZE 64
+#define WORK_ITEM_POOL_SIZE 256
+#define LOW_LOAD_THRESHOLD 2  // Use single worker when pending < 2
 
 static inline void uint32_to_be(uint32_t val, uint8_t *bytes) {
     bytes[0] = (val >> 24) & 0xFF;
@@ -48,6 +54,7 @@ typedef struct {
     work_item_t *head;
     work_item_t *tail;
     int shutdown;
+    int pending_connections;
 } work_queue_t;
 
 static work_queue_t work_queue = {
@@ -55,8 +62,25 @@ static work_queue_t work_queue = {
     .cond = PTHREAD_COND_INITIALIZER,
     .head = NULL,
     .tail = NULL,
-    .shutdown = 0
+    .shutdown = 0,
+    .pending_connections = 0
 };
+
+// Pre-allocated work item pool
+static work_item_t work_item_pool[WORK_ITEM_POOL_SIZE];
+static int work_item_pool_next = 0;
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static work_item_t* get_work_item(void) {
+    pthread_mutex_lock(&pool_lock);
+    if (work_item_pool_next < WORK_ITEM_POOL_SIZE) {
+        work_item_t *item = &work_item_pool[work_item_pool_next++];
+        pthread_mutex_unlock(&pool_lock);
+        return item;
+    }
+    pthread_mutex_unlock(&pool_lock);
+    return malloc(sizeof(work_item_t));  // Fallback to dynamic allocation
+}
 
 static volatile sig_atomic_t server_running = 1;
 static int server_sock_global = -1;
@@ -72,17 +96,18 @@ static void signal_handler(int sig) {
 }
 
 static void enqueue_work(int client_sock, lsrp_handler_t handler) {
-    work_item_t *item = malloc(sizeof(work_item_t));
+    work_item_t *item = get_work_item();
     if (!item) {
         close(client_sock);
         return;
     }
-    
+
     item->client_sock = client_sock;
     item->handler = handler;
     item->next = NULL;
-    
+
     pthread_mutex_lock(&work_queue.lock);
+    work_queue.pending_connections++;  // Track pending
     if (work_queue.tail) {
         work_queue.tail->next = item;
     } else {
@@ -193,22 +218,42 @@ static void process_request(int client_sock, lsrp_handler_t handler) {
 
 static void* worker_thread(void* arg) {
     (void)arg;
-    
+
+    // Pre-warm JS context for this thread
+    prewarm_thread_context();
+
     while (1) {
         work_item_t *item = dequeue_work();
         if (!item) break;
-        
+
         process_request(item->client_sock, item->handler);
-        free(item);
+
+        // Decrement pending counter
+        pthread_mutex_lock(&work_queue.lock);
+        work_queue.pending_connections--;
+        pthread_mutex_unlock(&work_queue.lock);
+
+        // Check if item is from pool or dynamically allocated
+        if (item < work_item_pool || item >= work_item_pool + WORK_ITEM_POOL_SIZE) {
+            free(item);
+        }
+        // Pool items are implicitly returned by pool reset on shutdown
     }
-    
+
     return NULL;
 }
 
-int lsrp_server_start(int port, lsrp_handler_t handler) {
+int lsrp_server_start(int port, lsrp_handler_t handler, int thread_pool_size) {
     if (!handler) {
         fprintf(stderr, "No handler provided\n");
         return -1;
+    }
+
+    // Validate and set thread pool size
+    if (thread_pool_size <= 0) {
+        thread_pool_size = DEFAULT_THREAD_POOL_SIZE;
+    } else if (thread_pool_size > MAX_THREAD_POOL_SIZE) {
+        thread_pool_size = MAX_THREAD_POOL_SIZE;
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -227,10 +272,22 @@ int lsrp_server_start(int port, lsrp_handler_t handler) {
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 
-    pthread_t workers[THREAD_POOL_SIZE];
-    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+    pthread_t *workers = malloc(thread_pool_size * sizeof(pthread_t));
+    if (!workers) {
+        fprintf(stderr, "Failed to allocate worker thread array\n");
+        return -1;
+    }
+
+    for (int i = 0; i < thread_pool_size; i++) {
         if (pthread_create(&workers[i], NULL, worker_thread, NULL) != 0) {
             fprintf(stderr, "Failed to create worker thread %d\n", i);
+            // Cleanup already created threads
+            work_queue.shutdown = 1;
+            pthread_cond_broadcast(&work_queue.cond);
+            for (int j = 0; j < i; j++) {
+                pthread_join(workers[j], NULL);
+            }
+            free(workers);
             return -1;
         }
     }
@@ -272,7 +329,7 @@ int lsrp_server_start(int port, lsrp_handler_t handler) {
     }
 
     fprintf(stderr, "LSRP server with thread pool (%d workers) listening on port %d\n",
-            THREAD_POOL_SIZE, port);
+            thread_pool_size, port);
 
     while (server_running) {
         struct sockaddr_in client_addr;
@@ -284,17 +341,31 @@ int lsrp_server_start(int port, lsrp_handler_t handler) {
             continue;
         }
 
-        enqueue_work(client_sock, handler);
+        // Hybrid approach: check current load
+        int pending;
+        pthread_mutex_lock(&work_queue.lock);
+        pending = work_queue.pending_connections;
+        pthread_mutex_unlock(&work_queue.lock);
+
+        if (pending < LOW_LOAD_THRESHOLD) {
+            // Low load: process directly in accept thread (like HTTP)
+            process_request(client_sock, handler);
+            close(client_sock);
+        } else {
+            // High load: use thread pool
+            enqueue_work(client_sock, handler);
+        }
     }
 
     fprintf(stderr, "\nShutting down LSRP server...\n");
     work_queue.shutdown = 1;
     pthread_cond_broadcast(&work_queue.cond);
 
-    for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+    for (int i = 0; i < thread_pool_size; i++) {
         pthread_join(workers[i], NULL);
     }
 
+    free(workers);
     shutdown(server_sock_global, SHUT_RDWR);
     close(server_sock_global);
     return 0;

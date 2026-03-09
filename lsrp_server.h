@@ -15,9 +15,10 @@ typedef int (*lsrp_handler_t)(lsrp_request_t *req, lsrp_response_t *resp);
  * Start LSRP server.
  * @param port Port to listen on.
  * @param handler Callback for each request.
+ * @param thread_pool_size thread pool size
  * @return 0 on success, <0 on error. Runs forever until interrupted.
  */
-int lsrp_server_start(int port, lsrp_handler_t handler);
+int lsrp_server_start(int port, lsrp_handler_t handler, int thread_pool_size);
 
 struct handle_args {
     int client_sock;
