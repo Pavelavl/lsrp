@@ -342,19 +342,13 @@ int lsrp_server_start(int port, lsrp_handler_t handler, int thread_pool_size) {
         }
 
         // Hybrid approach: check current load
-        int pending;
         pthread_mutex_lock(&work_queue.lock);
-        pending = work_queue.pending_connections;
         pthread_mutex_unlock(&work_queue.lock);
 
-        if (pending < LOW_LOAD_THRESHOLD) {
-            // Low load: process directly in accept thread (like HTTP)
-            process_request(client_sock, handler);
-            close(client_sock);
-        } else {
-            // High load: use thread pool
-            enqueue_work(client_sock, handler);
-        }
+        // Always use thread pool — never block the accept thread.
+        // Processing in accept thread caused hangs because accept()
+        // couldn't service new connections while handler was running.
+        enqueue_work(client_sock, handler);
     }
 
     fprintf(stderr, "\nShutting down LSRP server...\n");

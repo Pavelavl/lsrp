@@ -1,4 +1,5 @@
 #include "lsrp_client.h"
+#include <sys/time.h>
 
 static void uint32_to_be(uint32_t val, uint8_t *bytes) {
     bytes[0] = (val >> 24) & 0xFF;
@@ -40,6 +41,11 @@ int lsrp_client_send(const char *host, int port, const char *params, lsrp_respon
         return -5;
     }
     freeaddrinfo(res);
+
+    // Set timeouts to prevent blocking forever
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     // Prepare request
     uint8_t *request = malloc(LSRP_MAGIC_LEN + 4 + params_len);
